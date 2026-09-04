@@ -4,14 +4,14 @@ Use it in the value position of a `class` attribute when the list mixes static a
 
 ```rust
 # #[topcoat::view::component]
-# async fn example() -> topcoat::Result {
-use topcoat::view::{class, view};
+# async fn example() -> topcoat::Result<impl topcoat::view::View> {
+use topcoat::view::{View, class, view};
 
 let is_active = true;
 
-view! {
+Ok(view! {
     <button class=(class!("btn", "btn-lg", "active" if is_active))>"Save"</button>
-}
+})
 # }
 ```
 
@@ -25,21 +25,21 @@ The body is a comma-separated list of entries. Each entry is a Rust expression, 
 
 ```rust
 # #[topcoat::view::component]
-# async fn example() -> topcoat::Result {
-use topcoat::view::{class, view};
+# async fn example() -> topcoat::Result<impl topcoat::view::View> {
+use topcoat::view::{View, class, view};
 
 let variant: Option<&str> = Some("primary");
 let sizes = vec!["px-4".to_owned(), "py-2".to_owned()];
 let enabled = false;
 
-view! {
+Ok(view! {
     <button class=(class!(
         "btn",
         variant,
         sizes,
         "cursor-pointer" if enabled else "opacity-50",
     ))>"Save"</button>
-}
+})
 # }
 ```
 
@@ -51,15 +51,15 @@ An absent entry is skipped without leaving a leftover space: `None`, empty strin
 
 ```rust
 # #[topcoat::view::component]
-# async fn example() -> topcoat::Result {
-use topcoat::view::{class, view};
+# async fn example() -> topcoat::Result<impl topcoat::view::View> {
+use topcoat::view::{View, class, view};
 
 let variant: Option<&str> = None;
 
 // Renders `<p></p>`.
-view! {
+Ok(view! {
     <p class=(class!(variant, "active" if false))></p>
-}
+})
 # }
 ```
 
@@ -79,6 +79,6 @@ A `class!` value takes its type from its entries. A list of literals always has 
 [`Class`]: struct.Class.html
 [`StaticClass`]: type.StaticClass.html
 [`ClassViewParts`]: trait.ClassViewParts.html
-[`AttributeValue`]: struct.AttributeValue.html
+[`AttributeValue`]: enum.AttributeValue.html
 [`class!`]: macro.class.html
 [`topcoat::view::Class`]: struct.Class.html

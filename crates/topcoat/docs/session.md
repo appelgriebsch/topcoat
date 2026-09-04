@@ -18,6 +18,8 @@ The lifecycle is a handful of functions taking `cx: &Cx`:
 
 Within a request the presented token is read once and cached, and [`start`], [`stop`], and [`rotate`] update that cached view, so a page rendered after a login sees the new session immediately.
 
+Changing the session involves setting cookies, which is only possible if the response body has not begun streaming yet. The [cookie guide](crate::cookie#writes-must-happen-before-the-response) explains this in more detail.
+
 # Setup
 
 Register session support on the router with [`RouterBuilderSessionExt::sessions`]. The default [`SessionConfig`] carries the token in a session cookie, which needs cookie support installed as well:
@@ -90,17 +92,17 @@ use topcoat::{
     Result,
     context::Cx,
     router::{error::RouterErrorExt, page},
-    view::view,
+    view::{View, view},
 };
 # #[derive(Clone)] struct User { name: String }
 # async fn current_user(_cx: &Cx) -> Result<Option<User>> { Ok(None) }
 
 #[page("/account")]
-async fn account(cx: &Cx) -> Result {
+async fn account(cx: &Cx) -> Result<impl View> {
     let user = current_user(cx).await?.ok_or_redirect("/login")?;
-    view! {
+    Ok(view! {
         <h1>"Account of " (&user.name)</h1>
-    }
+    })
 }
 ```
 

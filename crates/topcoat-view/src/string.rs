@@ -6,12 +6,12 @@ use std::ops::Deref;
 /// Use it to optimize your rendering, for example for static class strings.
 ///
 /// ```rust
-/// # use topcoat::view::{PromotedStr, component, view};
+/// # use topcoat::view::{PromotedStr, View, component, view};
 /// # #[component]
-/// # async fn example() -> topcoat::Result {
-/// view! {
+/// # async fn example() -> topcoat::Result<impl View> {
+/// Ok(view! {
 ///     <div>(PromotedStr(&"hello"))</div>
-/// }
+/// })
 /// # }
 /// ```
 ///
@@ -19,7 +19,7 @@ use std::ops::Deref;
 /// constant into the binary's read-only data. Only a constant can be
 /// promoted, so a string that is only known at run time goes through
 /// [`StaticStr`] instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PromotedStr(pub &'static &'static str);
 
 impl Deref for PromotedStr {
@@ -38,18 +38,18 @@ impl Deref for PromotedStr {
 /// wrapping one in this type records the string as is:
 ///
 /// ```rust
-/// # use topcoat::view::{StaticStr, component, view};
+/// # use topcoat::view::{StaticStr, View, component, view};
 /// # #[component]
-/// # async fn example() -> topcoat::Result {
+/// # async fn example() -> topcoat::Result<impl View> {
 /// # let name: &'static str = "hello";
-/// view! {
+/// Ok(view! {
 ///     <div>(StaticStr(name))</div>
-/// }
+/// })
 /// # }
 /// ```
 ///
 /// A string written as a literal can be further optimized by using [`PromotedStr`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StaticStr(pub &'static str);
 
 impl Deref for StaticStr {

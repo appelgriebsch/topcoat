@@ -7,10 +7,11 @@ use super::{CURRENT, Identity, IdentityKey, SiteKey};
 /// Creating a guard derives the identity one level down from the installed
 /// one and swaps it in; dropping the guard swaps the previous identity
 /// back, also when the region panics. The guard is the synchronous
-/// counterpart of [`IdentityFuture`](super::IdentityFuture), for component
-/// bodies that build in a single burst.
+/// counterpart of [`IdentityView`](super::IdentityView), for regions that
+/// build in a single burst.
 #[must_use = "the identity is uninstalled when the guard drops"]
 pub struct IdentityGuard {
+    identity: Identity,
     prev: Option<Identity>,
     /// The guard restores a thread local, so it must stay on the thread it
     /// was created on.
@@ -41,9 +42,21 @@ impl IdentityGuard {
     /// when resuming an isolated render at an identity captured earlier.
     pub fn install(identity: Identity) -> Self {
         Self {
+            identity,
             prev: CURRENT.replace(Some(identity)),
             _not_send: PhantomData,
         }
+    }
+
+    /// Returns the identity this guard installed.
+    ///
+    /// Hands the derived identity back so a region that builds inside the
+    /// guard and resolves outside it, such as a component invocation whose
+    /// props are built here and whose view is polled later, can install
+    /// the same identity again.
+    #[must_use]
+    pub fn identity(&self) -> Identity {
+        self.identity
     }
 }
 

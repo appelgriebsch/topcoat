@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use topcoat::{
     Result,
     context::Cx,
-    view::{View, component, identity::Identity, view},
+    view::{Child, View, ViewExt, component, identity::Identity, view},
 };
 
 fn empty_cx() -> Cx {
@@ -13,23 +13,26 @@ fn empty_cx() -> Cx {
 /// Renders its own identity hash as `label=hash;` for the assertions to
 /// parse back out.
 #[component]
-async fn probe(label: &str) -> Result {
+async fn probe(label: &str) -> Result<impl View> {
     let id = Identity::current().hash();
-    view! { (format!("{label}={id:x};")) }
+    Ok(view! { (format!("{label}={id:x};")) })
 }
 
 /// Renders the ambiguity error of its identity, or `ok` when there is none.
 #[component]
-async fn ambiguity() -> Result {
-    match Identity::try_current() {
-        Ok(_) => view! { "ok" },
-        Err(error) => view! { (error.to_string()) },
-    }
+async fn ambiguity() -> Result<impl View> {
+    let identity = Identity::try_current();
+    Ok(view! {
+        match identity {
+            Ok(_) => "ok",
+            Err(error) => (error.to_string()),
+        }
+    })
 }
 
 #[component]
-async fn wrapper(child: View) -> Result {
-    view! { (child) }
+async fn wrapper(child: Child<'_>) -> Result<impl View> {
+    Ok(view! { (child) })
 }
 
 /// Parses `label=hash;` pairs out of `rendered`.
@@ -47,7 +50,13 @@ fn ids(rendered: &str) -> HashMap<String, String> {
 async fn identities_are_stable_across_renders() {
     let cx = empty_cx();
     let __cx = &cx;
-    let render = || async { view! { probe(label: "a") }.unwrap().render(__cx) };
+    let render = || async {
+        view! { probe(label: "a") }
+            .single()
+            .await
+            .unwrap()
+            .render(__cx)
+    };
     assert_eq!(render().await, render().await);
 }
 
@@ -59,6 +68,8 @@ async fn sibling_invocations_have_distinct_identities() {
         probe(label: "a")
         probe(label: "b")
     }
+    .single()
+    .await
     .unwrap()
     .render(__cx);
 
@@ -76,6 +87,8 @@ async fn keys_give_each_iteration_its_own_stable_identity() {
                 probe(key: label, label: label)
             }
         }
+        .single()
+        .await
         .unwrap()
         .render(__cx);
         ids(&rendered)
@@ -97,6 +110,8 @@ async fn the_same_key_at_two_sites_stays_distinct() {
         probe(key: 1, label: "a")
         probe(key: 1, label: "b")
     }
+    .single()
+    .await
     .unwrap()
     .render(__cx);
 
@@ -108,7 +123,7 @@ async fn the_same_key_at_two_sites_stays_distinct() {
 async fn an_unkeyed_component_outside_a_loop_is_unambiguous() {
     let cx = empty_cx();
     let __cx = &cx;
-    let rendered = view! { ambiguity() }.unwrap().render(__cx);
+    let rendered = view! { ambiguity() }.single().await.unwrap().render(__cx);
     assert_eq!(rendered, "ok");
 }
 
@@ -121,6 +136,8 @@ async fn an_unkeyed_component_in_a_loop_reports_the_missing_key() {
             ambiguity()
         }
     }
+    .single()
+    .await
     .unwrap()
     .render(__cx);
 
@@ -138,6 +155,8 @@ async fn an_ambiguous_invocation_poisons_its_children() {
             wrapper(ambiguity())
         }
     }
+    .single()
+    .await
     .unwrap()
     .render(__cx);
 
@@ -155,6 +174,33 @@ async fn a_key_resolves_the_children_of_a_repeated_invocation() {
             wrapper(key: item, probe(label: item))
         }
     }
+    .single()
+    .await
+    .unwrap()
+    .render(__cx);
+
+    let ids = ids(&rendered);
+    assert_ne!(ids["a"], ids["b"]);
+}
+
+/// Invokes `probe` from its own template rather than as child content.
+#[component]
+async fn parent(label: &str) -> Result<impl View> {
+    Ok(view! { probe(label: label) })
+}
+
+#[tokio::test]
+async fn a_key_resolves_the_template_of_a_repeated_invocation() {
+    let cx = empty_cx();
+    let __cx = &cx;
+    let items = vec!["a", "b"];
+    let rendered = view! {
+        for item in items {
+            parent(key: item, label: item)
+        }
+    }
+    .single()
+    .await
     .unwrap()
     .render(__cx);
 

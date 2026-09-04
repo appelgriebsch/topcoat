@@ -23,27 +23,20 @@ use crate::component::{ComponentAttr, ComponentItem};
 ///   `ButtonProps`), deriving [`Props`] so it gets a typestate builder. `#[default]` and `#[into]`
 ///   on function parameters are forwarded to the corresponding props fields. `impl Trait` parameter
 ///   types are lifted into generic type parameters of the props struct.
-/// - a zero-sized marker struct named after the function that implements
-///   [`topcoat::view::Component`] with a `render` method calling the original function body.
-///
-/// With the `boxed` argument (`#[component(boxed)]`), `render` returns a
-/// heap-allocated `Pin<Box<dyn Future>>` whose type is spelled out in the
-/// signature, so the compiler never has to infer the future type from the
-/// body. Recursive components need this on at least one component in the
-/// cycle: with only opaque futures, computing any one future type requires
-/// type-checking the body that awaits the next, which loops back around.
+/// - a zero-sized marker struct named after the function, carrying the function's doc comments,
+///   that implements [`topcoat::view::Component`] with a `render` method calling the original
+///   function body.
 ///
 /// [`Props`]: derive.Props.html
 /// [`topcoat::view::Component`]: trait.Component.html
 pub struct Component {
-    attr: ComponentAttr,
     item: ComponentItem,
 }
 
 impl Component {
     #[must_use]
-    pub fn new(attr: ComponentAttr, item: ComponentItem) -> Self {
-        Self { attr, item }
+    pub fn new(_attr: ComponentAttr, item: ComponentItem) -> Self {
+        Self { item }
     }
 
     /// Parses a `#[component]` attribute and function item from token streams.
@@ -70,12 +63,13 @@ impl ToTokens for Component {
         );
 
         let attrs = item.attrs;
-        item.attrs = vec![];
-        item.sig.generics.params.insert(0, parse_quote! { '__cx });
+        item.attrs = vec![parse_quote!(#[allow(clippy::unused_async)])];
+        // The implicit `__cx` context parameter carries what `view!` bodies
+        // read: the request context.
+        item.sig.generics.params.insert(0, parse_quote! { '__a });
         item.sig
             .inputs
-            .insert(0, parse_quote! { __cx: &'__cx #topcoat_context::Cx });
-
+            .insert(0, parse_quote! { __cx: &'__a #topcoat_context::Cx });
         // The `#[default]` and `#[into]` helper attributes are only meaningful to
         // the `Props` derive, which sees them on the generated struct's fields.
         // They are not valid on the re-emitted function's parameters, so strip
@@ -86,13 +80,24 @@ impl ToTokens for Component {
             }
         }
 
+        // A component's borrows all live for the request: the context and
+        // every reference parameter arrive together, and the returned view
+        // may borrow from any of them. Renaming every elided lifetime to the
+        // one `'__a` says exactly that, gives the return type a name to use
+        // where the trait method spells it out and elision does not apply,
+        // and leaves an erased view (`BoxView`) a single lifetime to infer.
+        let mut signature_lifetimes = LifetimeVisitor::default();
+        signature_lifetimes.visit_return_type_mut(&mut item.sig.output);
+        for input in &mut item.sig.inputs {
+            signature_lifetimes.visit_fn_arg_mut(input);
+        }
         let ReturnType::Type(_, return_ty) = &item.sig.output else {
             unreachable!("validated in Parse");
         };
 
         let mut fields = Vec::new();
         let mut args = Vec::new();
-        let mut implicit_lifetime_visitor = ImplicitLifetimeVisitor { used: false };
+        let mut field_lifetimes = LifetimeVisitor::default();
         let mut impl_traits_visitor = ImplTraitParamVisitor {
             prefix: String::new(),
             count: 0,
@@ -110,7 +115,7 @@ impl ToTokens for Component {
                 args.push(quote! { cx });
             } else {
                 let mut ty = (*pat_type.ty).clone();
-                implicit_lifetime_visitor.visit_type_mut(&mut ty);
+                field_lifetimes.visit_type_mut(&mut ty);
                 impl_traits_visitor.prefix = pi.ident.unraw().to_string().to_pascal_case();
                 impl_traits_visitor.count = 0;
                 impl_traits_visitor.visit_type_mut(&mut ty);
@@ -122,8 +127,8 @@ impl ToTokens for Component {
             }
         }
 
-        if implicit_lifetime_visitor.used {
-            generics.params.insert(0, parse_quote! { '__implicit });
+        if field_lifetimes.used {
+            generics.params.insert(0, parse_quote! { '__a });
         }
         generics.params.extend(
             impl_traits_visitor
@@ -131,29 +136,57 @@ impl ToTokens for Component {
                 .into_iter()
                 .map(GenericParam::Type),
         );
-        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        let (impl_generics, _, where_clause) = generics.split_for_impl();
 
-        let phantom_args = generics
+        // Lifetimes belong to the props alone: `Component::Props` is generic
+        // over a single lifetime, and every lifetime the props borrow maps
+        // onto it. The marker only carries the type and const parameters.
+        let mut marker_generics = generics.clone();
+        marker_generics.params = generics
+            .params
+            .iter()
+            .filter(|param| !matches!(param, GenericParam::Lifetime(_)))
+            .cloned()
+            .collect();
+        let (marker_impl_generics, marker_ty_generics, _) = marker_generics.split_for_impl();
+        let props_args = generics
+            .params
+            .iter()
+            .map(|param| match param {
+                GenericParam::Lifetime(_) => quote! { '__props },
+                GenericParam::Type(param) => {
+                    let ident = &param.ident;
+                    quote! { #ident }
+                }
+                GenericParam::Const(param) => {
+                    let ident = &param.ident;
+                    quote! { #ident }
+                }
+            })
+            .collect::<Vec<_>>();
+        let props_ty = if props_args.is_empty() {
+            quote! { #props_ident }
+        } else {
+            quote! { #props_ident<#(#props_args),*> }
+        };
+
+        let phantom_args = marker_generics
             .params
             .iter()
             .filter_map(|param| match param {
-                GenericParam::Lifetime(param) => {
-                    let lifetime = &param.lifetime;
-                    Some(quote! { &#lifetime () })
-                }
                 GenericParam::Type(param) => {
                     let ident = &param.ident;
                     Some(quote! { #ident })
                 }
-                GenericParam::Const(_) => None,
+                GenericParam::Lifetime(_) | GenericParam::Const(_) => None,
             })
             .collect::<Vec<_>>();
 
-        // A lifetime or type parameter must appear in the body, so generic
-        // markers carry a `PhantomData` field. Markers with no such parameters
-        // are emitted as unit structs, which makes the marker's bare name a
-        // value (`combobox_content`) rather than a tuple-struct constructor,
-        // letting callers pass it directly, e.g. `router.shard(combobox_content)`.
+        // A type parameter must appear in the body, so generic markers carry
+        // a `PhantomData` field. Markers with no such parameters are emitted
+        // as unit structs, which makes the marker's bare name a value
+        // (`combobox_content`) rather than a tuple-struct constructor, letting
+        // callers pass it directly, e.g. `router.shard(combobox_content)`.
         let (marker_body, default_value) = if phantom_args.is_empty() {
             (quote! { #where_clause; }, quote! { Self })
         } else {
@@ -167,68 +200,45 @@ impl ToTokens for Component {
             )
         };
 
+        // The marker is what a `view!` invocation names, so it carries the
+        // function's doc comments: hovering the component shows them.
+        let docs = attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("doc"))
+            .collect::<Vec<_>>();
         quote_spanned! {ident.span()=>
+            #(#docs)*
             #[allow(non_camel_case_types)]
-            #vis struct #ident #impl_generics #marker_body
+            #vis struct #ident #marker_impl_generics #marker_body
         }
         .to_tokens(tokens);
 
-        // In boxed mode the future type is spelled out in the signature, so
-        // the compiler never has to infer it from the body. That breaks the
-        // inference cycle recursive components would otherwise cause, where
-        // computing one component's opaque future type requires type-checking
-        // the body that awaits the next component's, looping back around.
-        // Refining the trait's opaque return type to the concrete boxed one is
-        // deliberate and invisible to `view!` callers.
-        let render = if self.attr.boxed() {
-            quote! {
-                #[allow(refining_impl_trait)]
-                fn render<'__cx>(
-                    self,
-                    cx: &'__cx #topcoat_context::Cx,
-                    props: Self::Props,
-                ) -> ::core::pin::Pin<::std::boxed::Box<
-                    dyn ::core::future::Future<Output = #return_ty>
-                        + ::core::marker::Send
-                        + '__cx,
-                >>
-                where
-                    Self: '__cx,
-                    Self::Props: '__cx,
-                {
-                    ::std::boxed::Box::pin(async move {
-                        #item
-                        #ident(cx, #(#args),*).await
-                    })
-                }
-            }
-        } else {
-            quote! {
-                async fn render<'__cx>(
-                    self,
-                    cx: &'__cx #topcoat_context::Cx,
-                    props: Self::Props,
-                ) -> #return_ty
-                where
-                    Self: '__cx,
-                    Self::Props: '__cx,
-                {
-                    #item
-                    #ident(cx, #(#args),*).await
-                }
+        let render = quote! {
+            fn render<'__a, '__props>(
+                self,
+                cx: &'__a #topcoat_context::Cx,
+                props: Self::Props<'__props>,
+            ) -> impl Future<Output = #return_ty> + ::core::marker::Send + '__a
+            where
+                '__props: '__a,
+                Self: '__a,
+                Self::Props<'__props>: '__a,
+            {
+                #item
+                #ident(cx, #(#args),*)
             }
         };
 
         quote! {
-            impl #impl_generics ::core::default::Default for #ident #ty_generics #where_clause {
+            impl #marker_impl_generics ::core::default::Default for #ident #marker_ty_generics #where_clause {
                 #[inline]
                 fn default() -> Self {
                     #default_value
                 }
             }
 
-            impl #impl_generics #topcoat_view::Component for #ident #ty_generics #where_clause {
-                type Props = #props_ident #ty_generics;
+            impl #marker_impl_generics #topcoat_view::Component for #ident #marker_ty_generics #where_clause {
+                type Props<'__props> = #props_ty;
 
                 #render
             }
@@ -276,23 +286,55 @@ impl VisitMut for ImplTraitParamVisitor {
     }
 }
 
-struct ImplicitLifetimeVisitor {
+/// Renames every elided lifetime to `'__a`.
+///
+/// A component has one lifetime: everything it borrows lives for the
+/// request. The single name spells that out in positions where elision
+/// does not apply, like the props struct's fields and the return type
+/// respelled in the `render` signature.
+#[derive(Default)]
+struct LifetimeVisitor {
+    /// Whether any elided lifetime was renamed.
     used: bool,
 }
 
-impl VisitMut for ImplicitLifetimeVisitor {
+impl VisitMut for LifetimeVisitor {
     fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
         if lt.ident == "_" {
-            *lt = parse_quote! { '__implicit };
+            *lt = parse_quote! { '__a };
             self.used = true;
         }
     }
 
     fn visit_type_reference_mut(&mut self, tr: &mut TypeReference) {
         if tr.lifetime.is_none() {
-            tr.lifetime = Some(parse_quote! { '__implicit });
+            tr.lifetime = Some(parse_quote! { '__a });
             self.used = true;
         }
         visit_mut::visit_type_reference_mut(self, tr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::*;
+
+    #[test]
+    fn doc_comments_land_on_the_marker_and_props_structs() {
+        let component = Component::parse(
+            TokenStream::new(),
+            quote! {
+                /// Renders a badge.
+                async fn badge(label: &str) -> Result { todo!() }
+            },
+        )
+        .unwrap();
+        let out = component.to_token_stream().to_string();
+        let doc = out.find("Renders a badge.").expect(&out);
+        let marker = out.find("struct badge").expect(&out);
+        assert!(doc < marker, "{out}");
+        assert_eq!(out.matches("Renders a badge.").count(), 2, "{out}");
     }
 }

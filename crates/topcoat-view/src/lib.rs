@@ -1,23 +1,26 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod buffer;
+mod child;
 mod component;
 mod css;
 mod format;
 mod html;
 pub mod identity;
-mod part;
 mod props;
+mod region;
 mod string;
 pub mod svg;
 mod view;
 
+pub use buffer::*;
+pub use child::*;
 pub use component::*;
 pub use css::*;
 pub use format::*;
 pub use html::*;
-pub use part::*;
 pub use props::*;
+pub use region::*;
 pub use string::*;
 pub use view::*;
 

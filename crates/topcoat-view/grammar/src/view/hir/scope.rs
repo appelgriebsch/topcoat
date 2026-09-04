@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use topcoat_core_grammar::paths::{topcoat_error, topcoat_view};
+use topcoat_core_grammar::paths::topcoat_view;
 
 use super::{
     Bindings, Node, StaticSegment,
@@ -18,97 +18,131 @@ impl Scope {
         Self { nodes }
     }
 
-    pub fn emit_root(&self) -> TokenStream {
-        let view = self.emit_view();
-        let body = quote! {
-            async {
-                ::core::result::Result::<#topcoat_view::View, #topcoat_error::Error>::Ok(#view)
-            }
-        };
-        if self.is_static() {
-            quote! { #body.await }
-        } else {
-            quote! { #topcoat_view::internal::build(#body).await }
-        }
-    }
-
-    /// Whether this scope emits through an optimized static path that never
-    /// touches an instruction memory.
-    fn is_static(&self) -> bool {
-        self.nodes.is_empty()
-            || (self.nodes.len() == 1 && matches!(&self.nodes[0], Node::StaticSegment(_)))
-    }
-
-    /// Whether this scope renders components, directly or anywhere under its
-    /// nested scopes.
     pub(crate) fn is_async(&self) -> bool {
         self.nodes.iter().any(Node::is_async)
     }
 
-    /// Emits this scope as an expression yielding a
-    /// [`View`](topcoat_view::View).
-    ///
-    /// Nested scopes (control-flow bodies and component children) are emitted
-    /// with this and hoisted by the enclosing scope, so their expansion runs
-    /// inside the top-level `async` block where `?` propagates to the block's
-    /// `Result`.
-    ///
-    /// When more than one of the scope's nodes renders components, their
-    /// futures are joined so sibling components render concurrently. With at
-    /// most one such node there is nothing to overlap, and the node awaits
-    /// inline.
-    pub(crate) fn emit_view(&self) -> TokenStream {
-        if self.nodes.is_empty() {
-            // Optimized path: The view has no content.
-            quote! { #topcoat_view::View::empty() }
-        } else if self.nodes.len() == 1
-            && let Node::StaticSegment(StaticSegment { string }) = &self.nodes[0]
-        {
-            // Optimized path: The view is a single static string, which needs
-            // no instruction block.
-            quote! { #topcoat_view::View::unescaped_unchecked(#string) }
-        } else {
-            let concurrent = self.nodes.iter().filter(|node| node.is_async()).count() >= 2;
-            let mut emitter = Emitter::new(!concurrent);
-            for node in &self.nodes {
-                node.emit(&mut emitter);
+    pub(crate) fn emit_block(&self) -> TokenStream {
+        debug_assert!(!self.is_async(), "an async scope resolves by being polled");
+        match self.nodes.as_slice() {
+            [] => quote! { #topcoat_view::ViewHandle::empty() },
+            [Node::StaticSegment(StaticSegment { string })] => {
+                quote! { #topcoat_view::ViewHandle::unescaped_unchecked(#string) }
             }
-            emitter.finish()
+            nodes => {
+                let mut emitter = Emitter::new(true);
+                for node in nodes {
+                    node.emit(&mut emitter);
+                }
+                emitter.finish_block()
+            }
         }
     }
 
-    /// Emits this scope as an expression yielding a future of the view, for a
-    /// position joined with sibling futures, like the branches of an `if` or
-    /// the iterations of a `for` loop.
+    /// Emits a top-level `view!` invocation: a `ScopeView` around a
+    /// `MoveView` whose `async move` body builds the scope's view and drives
+    /// it in place.
     ///
-    /// The future borrows its environment, except for the values bound by
-    /// the enclosing pattern: those die with the branch or iteration that
-    /// produced them, so the future carries them in a `Capture` packed where
-    /// they are still alive and taken back apart inside the future.
-    pub(crate) fn emit_future(&self, bindings: &Bindings) -> TokenStream {
-        let view = self.emit_view();
-        if !self.is_async() {
-            // Without components the view builds synchronously where the
-            // expression is evaluated and only needs wrapping into a ready
-            // future.
-            quote! { #topcoat_view::internal::ready(#view) }
-        } else if bindings.is_empty() {
+    /// The block captures every value the template uses, so the view owns its
+    /// data and the expressions inside borrow from the block. The built view
+    /// is driven inside the block that evaluates the template, so what its
+    /// expressions borrow from that block is still alive.
+    ///
+    /// With `owns_cx`, the block expects an owned `__cx` context in scope and
+    /// captures it, rebinding `__cx` to a borrow of it inside; the view then
+    /// does not borrow the caller's context.
+    pub fn emit_view(&self, owns_cx: bool) -> TokenStream {
+        let prologue = borrow_cx(owns_cx);
+        let inner = self.emit_inner(|view| {
             quote! {
-                async {
-                    ::core::result::Result::<_, #topcoat_error::Error>::Ok(#view)
-                }
+                #topcoat_view::internal::MoveView::drive(#view).await
             }
-        } else {
-            let idents = bindings.idents();
-            let rebinds = bindings.rebinds();
-            quote! {{
-                let __captured = #topcoat_view::internal::Capture((#(#idents,)*));
-                async {
-                    let (#(#rebinds,)*) = __captured.take();
-                    ::core::result::Result::<_, #topcoat_error::Error>::Ok(#view)
-                }
-            }}
+        });
+        quote! {
+            #topcoat_view::internal::ScopeView::new(
+                #topcoat_view::internal::MoveView::new(async move {
+                    #prologue
+                    #inner
+                })
+            )
         }
+    }
+
+    /// Emits an `emit!` invocation: the scope's view, built inline in a
+    /// `ScopeView` of its own.
+    ///
+    /// The view always owns a buffer, so its content renders anywhere even
+    /// when it is emitted inside another build. The body builds inside a
+    /// closure the scope evaluates with that buffer installed, so the blocks
+    /// it hoists land in the buffer its polls run against. Nothing is moved
+    /// into an async block: the caller awaits the view where it is emitted,
+    /// so the template borrows from the enclosing block as it stands.
+    ///
+    /// With `owns_cx`, an owned `__cx` context is in scope and the view
+    /// borrows it.
+    pub fn emit_emit(&self, owns_cx: bool) -> TokenStream {
+        let prologue = borrow_cx(owns_cx);
+        let inner = self.emit_inert();
+        quote! {
+            #topcoat_view::internal::ScopeView::self_contained(|| {
+                #prologue
+                #inner
+            })
+        }
+    }
+
+    /// Emits this scope as an inert view value: a block expression that
+    /// evaluates the scope's expressions in source order and builds its
+    /// `JoinView`.
+    ///
+    /// The view owns the evaluated values; whatever the expressions borrow
+    /// from the environment, it borrows. Nothing is moved into an async
+    /// block, so a scope nested in an enclosing one leaves that scope's
+    /// bindings borrowed rather than taking them.
+    pub(crate) fn emit_inert(&self) -> TokenStream {
+        self.emit_inner(|view| view)
+    }
+
+    pub(crate) fn emit_captured(&self, bindings: &Bindings) -> TokenStream {
+        if bindings.is_empty() {
+            return self.emit_inert();
+        }
+
+        let idents = bindings.idents();
+        let rebinds = bindings.rebinds();
+
+        let inner = self.emit_inner(|view| {
+            quote! {
+                #topcoat_view::internal::MoveView::drive(#view).await
+            }
+        });
+
+        quote! {{
+            let __captured = #topcoat_view::internal::Capture((#(#idents,)*));
+            #topcoat_view::internal::MoveView::new(async {
+                let (#(#rebinds,)*) = __captured.take();
+                #inner
+            })
+        }}
+    }
+
+    fn emit_inner(&self, tail: impl FnOnce(TokenStream) -> TokenStream) -> TokenStream {
+        let mut emitter = Emitter::new(false);
+        for node in &self.nodes {
+            node.emit(&mut emitter);
+        }
+        emitter.finish(tail)
+    }
+}
+
+/// Rebinds an owned `__cx` context to a borrow of it, so the template reads
+/// the same `&Cx` it would from an ambient context. Empty when the context is
+/// already borrowed.
+fn borrow_cx(owns_cx: bool) -> TokenStream {
+    if owns_cx {
+        quote! { let __cx = &__cx; }
+    } else {
+        TokenStream::new()
     }
 }
 
@@ -125,7 +159,7 @@ mod tests {
     };
 
     fn rendered(builder: ViewBuilder) -> String {
-        builder.finish().emit_root().to_string()
+        builder.finish().emit_view(false).to_string()
     }
 
     fn add_component(builder: &mut ViewBuilder, name: &str) {
@@ -154,10 +188,48 @@ mod tests {
     }
 
     #[test]
-    fn empty_top_level_view_emits_view_empty() {
+    fn a_root_view_is_a_scoped_move_view_driving_its_body() {
         let out = rendered(ViewBuilder::new());
-        assert!(out.contains("async"));
-        assert!(out.contains(&quote! { #topcoat_view::View::empty }.to_string()));
+        assert!(
+            out.starts_with(":: topcoat_view :: internal :: ScopeView :: new ("),
+            "{out}"
+        );
+        assert!(out.contains("MoveView :: new (async move"), "{out}");
+        assert!(out.contains("MoveView :: drive ("), "{out}");
+        assert!(out.ends_with(". await } }))"), "{out}");
+    }
+
+    #[test]
+    fn an_emitted_root_is_a_self_contained_scope_over_its_body() {
+        let out = ViewBuilder::new().finish().emit_emit(false).to_string();
+        assert!(
+            out.starts_with(":: topcoat_view :: internal :: ScopeView :: self_contained (||"),
+            "{out}"
+        );
+        // The body is emitted inline, so it is neither moved into an async
+        // block nor driven: the caller awaits it where it is emitted.
+        assert!(!out.contains("MoveView"), "{out}");
+        assert!(!out.contains(":: drive (__view) . await"), "{out}");
+    }
+
+    #[test]
+    fn a_root_view_is_driven_inside_the_template_block() {
+        let mut builder = ViewBuilder::new();
+        builder.local_binding(&syn::parse_quote!(x), &syn::parse_quote!(&value()));
+        builder.expr(ExprKind::Node, quote! { x });
+        let out = rendered(builder);
+        // The binding borrows a temporary that lives until the end of its
+        // block; the drive runs in that block, so the borrow is still valid.
+        let block = out.find("{ let x = & value ()").expect(&out);
+        let drive = out.find("MoveView :: drive (").expect(&out);
+        assert!(block < drive, "{out}");
+        assert!(out.ends_with(". await } }))"), "{out}");
+    }
+
+    #[test]
+    fn a_view_without_units_joins_over_unit() {
+        let out = rendered(ViewBuilder::new());
+        assert!(out.contains("JoinView :: new (__cx , () , move | __b , () |"));
     }
 
     #[test]
@@ -171,12 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn single_static_segment_needs_no_instruction_block() {
+    fn static_markup_is_pushed_verbatim() {
         let mut builder = ViewBuilder::new();
         builder.str_unescaped("<div>static</div>");
         let out = rendered(builder);
-        assert!(out.contains("unescaped_unchecked"));
-        assert!(!out.contains("internal :: block"));
+        assert!(out.contains("__b . markup (& \"<div>static</div>\")"));
     }
 
     #[test]
@@ -197,55 +268,129 @@ mod tests {
     }
 
     #[test]
-    fn expression_is_hoisted_and_pushed_with_builder_method() {
+    fn node_expression_is_classified_and_joined_as_a_unit() {
         let mut builder = ViewBuilder::new();
         builder.str_unescaped("<p>");
         builder.expr(ExprKind::Node, quote! { value });
         builder.str_unescaped("</p>");
         let out = rendered(builder);
-        assert!(out.contains("let __expr0 = value"));
-        assert!(out.contains("internal :: block"));
-        assert!(out.contains("__b . markup (& \"<p>\")"));
-        assert!(out.contains("__b . node (__expr0)"));
-        assert!(out.contains("__b . markup (& \"</p>\")"));
+        assert!(
+            out.contains(
+                "let (__expr0_parts , __expr0) = :: topcoat_view :: internal :: NodeClassify :: classify (value)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("JoinUnit :: new (__expr0 , ())"), "{out}");
+        assert!(out.contains("JoinView :: new"), "{out}");
+        assert!(out.contains("move | __b , (__view0 , ()) |"), "{out}");
+        assert!(out.contains("__b . markup (& \"<p>\")"), "{out}");
+        assert!(
+            out.contains("__b . node (__expr0_parts) ; __b . view (__view0)"),
+            "{out}"
+        );
+        assert!(out.contains("__b . markup (& \"</p>\")"), "{out}");
     }
 
     #[test]
-    fn if_else_hoists_both_branches_as_views() {
+    fn if_else_without_components_splices_the_taken_branch_in_place() {
         let mut builder = ViewBuilder::new();
         builder.if_else(&syn::parse_quote!(cond), |then_branch, else_branch| {
             then_branch.str_unescaped("yes");
             else_branch.str_unescaped("no");
         });
         let out = rendered(builder);
-        assert!(out.contains("let __expr0 = if cond"));
-        assert!(out.contains("else"));
-        assert!(out.contains("\"yes\""));
-        assert!(out.contains("\"no\""));
-        assert!(out.contains("__b . view (__expr0)"));
+        assert!(out.contains("let __expr0 = if cond"), "{out}");
+        assert!(
+            out.contains("ViewHandle :: unescaped_unchecked (\"yes\")"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ViewHandle :: unescaped_unchecked (\"no\")"),
+            "{out}"
+        );
+        assert!(out.contains("__b . view (__expr0)"), "{out}");
+        assert!(!out.contains("EitherView"), "{out}");
+        assert!(!out.contains("JoinUnit :: new (__expr0"), "{out}");
     }
 
     #[test]
-    fn if_without_else_falls_back_to_the_empty_view() {
+    fn if_else_with_a_component_branch_wraps_the_branch_views_in_either() {
+        let mut builder = ViewBuilder::new();
+        builder.if_else(&syn::parse_quote!(cond), |then_branch, else_branch| {
+            add_component(then_branch, "yes");
+            else_branch.str_unescaped("no");
+        });
+        let out = rendered(builder);
+        assert!(out.contains("let __expr0 = if cond"), "{out}");
+        assert!(out.contains("EitherView :: left"), "{out}");
+        assert!(out.contains("EitherView :: right"), "{out}");
+        assert!(out.contains("\"no\""), "{out}");
+        assert!(out.contains("JoinUnit :: new (__expr0 , ())"), "{out}");
+    }
+
+    #[test]
+    fn if_without_else_still_splices_an_else_view() {
         let mut builder = ViewBuilder::new();
         builder.if_else(&syn::parse_quote!(cond), |then_branch, _| {
             then_branch.str_unescaped("yes");
         });
         let out = rendered(builder);
-        assert!(out.contains("if cond"));
-        assert!(out.contains(&quote! { #topcoat_view::View::empty }.to_string()));
+        assert!(out.contains("if cond"), "{out}");
+        assert!(
+            out.contains("else { :: topcoat_view :: ViewHandle :: empty () }"),
+            "{out}"
+        );
     }
 
     #[test]
-    fn for_loop_collects_views_and_splices_them_in_order() {
+    fn for_loop_without_node_positions_builds_each_iteration_in_place() {
         let mut builder = ViewBuilder::new();
         builder.for_loop(&syn::parse_quote!(x), &syn::parse_quote!(xs), |body| {
-            body.str_unescaped("x");
+            body.str_unescaped("<b");
+            body.expr(ExprKind::AttributeUnescaped, quote! { ("id", x) });
+            body.str_unescaped("></b>");
         });
         let out = rendered(builder);
-        assert!(out.contains("for x in xs"));
-        assert!(out.contains("__views . push"));
-        assert!(out.contains("for __loop_view in __expr0"));
+        assert!(out.contains("for x in xs"), "{out}");
+        assert!(out.contains("__views . push ("), "{out}");
+        assert!(out.contains("Builder :: block (__cx , | __b |"), "{out}");
+        assert!(out.contains("__b . attribute_unescaped (__expr0)"), "{out}");
+        assert!(
+            out.contains("for __view in __expr0 { __b . view (__view) ; }"),
+            "{out}"
+        );
+        assert!(!out.contains("LoopView"), "{out}");
+        assert!(!out.contains("Capture"), "{out}");
+    }
+
+    #[test]
+    fn a_node_position_in_a_for_body_keeps_the_loop_joined() {
+        let mut builder = ViewBuilder::new();
+        builder.for_loop(&syn::parse_quote!(x), &syn::parse_quote!(xs), |body| {
+            body.expr(ExprKind::Node, quote! { x });
+        });
+        let out = rendered(builder);
+        assert!(out.contains("LoopView :: new (__iterations)"), "{out}");
+        assert!(out.contains("NodeClassify :: classify (x)"), "{out}");
+        assert!(out.contains("Capture ((x ,))"), "{out}");
+    }
+
+    #[test]
+    fn control_flow_inside_a_plain_for_body_builds_in_place() {
+        let mut builder = ViewBuilder::new();
+        builder.for_loop(&syn::parse_quote!(x), &syn::parse_quote!(xs), |body| {
+            body.str_unescaped("<b");
+            body.if_else(&syn::parse_quote!(x.ok), |then_branch, _| {
+                then_branch.expr(ExprKind::AttributeUnescaped, quote! { ("id", x.name) });
+            });
+            body.str_unescaped("></b>");
+        });
+        let out = rendered(builder);
+        assert!(out.contains("let __expr0 = if x . ok"), "{out}");
+        assert!(out.contains("__b . attribute_unescaped (__expr0)"), "{out}");
+        assert!(out.contains("__b . view (__expr0)"), "{out}");
+        assert!(!out.contains("EitherView"), "{out}");
+        assert!(!out.contains("LoopView"), "{out}");
     }
 
     #[test]
@@ -264,10 +409,11 @@ mod tests {
             );
         });
         let out = rendered(builder);
-        assert!(out.contains("let __expr0 = match v"));
-        assert!(out.contains("A =>"));
-        assert!(out.contains("B if flag =>"));
-        assert!(out.contains("__b . view (__expr0)"));
+        assert!(out.contains("let __expr0 = match v"), "{out}");
+        assert!(out.contains("A =>"), "{out}");
+        assert!(out.contains("B if flag =>"), "{out}");
+        assert!(out.contains("__b . view (__expr0)"), "{out}");
+        assert!(!out.contains("EitherView"), "{out}");
     }
 
     #[test]
@@ -280,33 +426,28 @@ mod tests {
     }
 
     #[test]
-    fn single_component_awaits_inline() {
+    fn a_component_render_becomes_a_joined_unit() {
         let mut builder = ViewBuilder::new();
         add_component(&mut builder, "solo");
         builder.str_unescaped("<hr>");
         let out = rendered(builder);
-        assert!(out.contains(". await ?"));
-        assert!(!out.contains("try_join !"));
+        assert!(out.contains("let __expr0 = {"));
+        assert!(out.contains("IdentityView :: new (__identity , :: topcoat_view :: internal :: ThenView :: new (__future"));
+        assert!(out.contains("Component :: render"));
+        assert!(out.contains("JoinUnit :: new (__expr0 , ())"));
     }
 
     #[test]
-    fn async_children_resolve_through_a_reserved_slot() {
+    fn children_pass_as_a_child_value() {
         let mut builder = ViewBuilder::new();
         add_component_with_children(&mut builder, "wrapper", &syn::parse_quote!(inner()));
         let out = rendered(builder);
-        assert!(out.contains("reserve ()"));
-        assert!(out.contains(". child (__placeholder)"));
-        assert!(out.contains("try_join ! (__render , __child)"));
-        assert!(out.contains("__slot . fill (__child)"));
-    }
-
-    #[test]
-    fn sync_children_build_before_the_props() {
-        let mut builder = ViewBuilder::new();
-        add_component_with_children(&mut builder, "wrapper", &syn::parse_quote!("static"));
-        let out = rendered(builder);
+        assert!(out.contains(". child ("));
+        assert!(out.contains("Child :: new"));
+        // The child's own stream is passed unpolled: the wrapper decides
+        // where, and whether, it is driven.
         assert!(!out.contains("reserve ()"));
-        assert!(!out.contains("try_join !"));
+        assert!(!out.contains("try_join"));
     }
 
     #[test]
@@ -315,8 +456,10 @@ mod tests {
         add_component(&mut builder, "first");
         add_component(&mut builder, "second");
         let out = rendered(builder);
-        assert!(out.contains("try_join ! (__expr0 , __expr1)"));
-        assert!(!out.contains(". await ?"));
+        assert!(out.contains("JoinUnit :: new (__expr0 , :: topcoat_view :: internal :: JoinUnit :: new (__expr1 , ()))"));
+        assert!(out.contains("move | __b , (__view0 , (__view1 , ())) |"));
+        assert!(out.contains("__b . view (__view0)"));
+        assert!(out.contains("__b . view (__view1)"));
     }
 
     #[test]
@@ -324,7 +467,7 @@ mod tests {
         let mut builder = ViewBuilder::new();
         add_component(&mut builder, "solo");
         let out = rendered(builder);
-        assert!(out.contains("IdentityFuture :: child"));
+        assert!(out.contains("IdentityGuard :: enter ("));
         assert!(out.contains("SiteKey :: new"));
         assert!(out.contains("file ! ()"));
     }
@@ -348,7 +491,7 @@ mod tests {
         let mut builder = ViewBuilder::new();
         add_keyed_component(&mut builder, "card", &syn::parse_quote!(item.id));
         let out = rendered(builder);
-        assert!(out.contains("IdentityFuture :: keyed"));
+        assert!(out.contains("IdentityGuard :: enter_keyed"));
         assert!(out.contains("item . id"));
     }
 
@@ -359,7 +502,7 @@ mod tests {
             add_component(body, "card");
         });
         let out = rendered(builder);
-        assert!(out.contains("IdentityFuture :: ambiguous"));
+        assert!(out.contains("IdentityGuard :: enter_ambiguous"));
         assert!(out.contains("\"`card`\""));
     }
 
@@ -370,8 +513,8 @@ mod tests {
             add_keyed_component(body, "card", &syn::parse_quote!(x));
         });
         let out = rendered(builder);
-        assert!(out.contains("IdentityFuture :: keyed"));
-        assert!(!out.contains("IdentityFuture :: ambiguous"));
+        assert!(out.contains("IdentityGuard :: enter_keyed"));
+        assert!(!out.contains("IdentityGuard :: enter_ambiguous"));
     }
 
     #[test]
@@ -383,7 +526,7 @@ mod tests {
             });
         });
         let out = rendered(builder);
-        assert!(out.contains("IdentityFuture :: ambiguous"));
+        assert!(out.contains("IdentityGuard :: enter_ambiguous"));
     }
 
     #[test]
@@ -396,23 +539,24 @@ mod tests {
         // The wrapper repeats unkeyed, but its child does not repeat
         // relative to it; the wrapper's ambiguity poisons the child at
         // runtime instead.
-        assert_eq!(out.matches("IdentityFuture :: ambiguous").count(), 1);
-        assert_eq!(out.matches("IdentityFuture :: child").count(), 1);
+        assert_eq!(out.matches("IdentityGuard :: enter_ambiguous").count(), 1);
+        assert_eq!(out.matches("IdentityGuard :: enter (").count(), 1);
     }
 
     #[test]
-    fn for_loop_with_component_body_joins_iterations() {
+    fn for_loop_with_component_body_pins_each_iteration() {
         let mut builder = ViewBuilder::new();
         builder.for_loop(&syn::parse_quote!(x), &syn::parse_quote!(xs), |body| {
             add_component(body, "item");
         });
         let out = rendered(builder);
-        assert!(out.contains("try_join_all"));
-        // The iteration future carries the loop binding, so it outlives the
-        // iteration; the single loop node then awaits inline.
-        assert!(out.contains("Capture ((x ,))"));
-        assert!(out.contains("let (x ,) = __captured . take ()"));
-        assert!(out.contains(". await ?"));
+        assert!(
+            out.contains("__iterations . push (:: std :: boxed :: Box :: pin ("),
+            "{out}"
+        );
+        assert!(out.contains("LoopView :: new (__iterations)"), "{out}");
+        assert!(out.contains("ThenView :: new"), "{out}");
+        assert!(out.contains("JoinUnit :: new (__expr0 , ())"), "{out}");
     }
 
     #[test]
@@ -422,11 +566,15 @@ mod tests {
             add_component(body, "item");
         });
         let out = rendered(builder);
-        assert!(!out.contains("async move"));
+        // Only the root stream owns its captures; the iteration streams
+        // borrow their environment, apart from the captured bindings.
+        assert_eq!(out.matches("async move").count(), 1);
+        assert!(out.contains("Capture ((x ,))"));
+        assert!(out.contains("let (x ,) = __captured . take ()"));
     }
 
     #[test]
-    fn an_if_let_branch_in_a_joined_position_captures_its_bindings() {
+    fn an_if_let_branch_captures_its_bindings() {
         let mut builder = ViewBuilder::new();
         add_component(&mut builder, "sibling");
         builder.if_else(
@@ -470,32 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn if_else_in_a_joined_position_wraps_branches_in_either() {
-        let mut builder = ViewBuilder::new();
-        add_component(&mut builder, "sibling");
-        builder.if_else(&syn::parse_quote!(cond), |then_branch, _| {
-            add_component(then_branch, "conditional");
-        });
-        let out = rendered(builder);
-        assert!(out.contains("Either :: Left"));
-        assert!(out.contains("Either :: Right"));
-        assert!(out.contains("try_join ! (__expr0 , __expr1)"));
-    }
-
-    #[test]
-    fn if_else_without_a_sibling_component_awaits_inline() {
-        let mut builder = ViewBuilder::new();
-        builder.if_else(&syn::parse_quote!(cond), |then_branch, _| {
-            add_component(then_branch, "conditional");
-        });
-        let out = rendered(builder);
-        assert!(out.contains(". await ?"));
-        assert!(!out.contains("Either ::"));
-        assert!(!out.contains("try_join !"));
-    }
-
-    #[test]
-    fn match_arms_in_a_joined_position_nest_eithers() {
+    fn match_arms_nest_eithers() {
         let mut builder = ViewBuilder::new();
         add_component(&mut builder, "sibling");
         builder.match_expr(&syn::parse_quote!(v), |arms| {
@@ -510,29 +633,15 @@ mod tests {
             });
         });
         let out = rendered(builder);
-        let either = quote! { #topcoat_view::internal::Either }.to_string();
-        assert!(out.contains(&format!("{either} :: Left")));
-        assert!(out.contains(&format!("{either} :: Right ({either} :: Left")));
-        assert!(out.contains(&format!("{either} :: Right ({either} :: Right")));
-    }
-
-    #[test]
-    fn branch_without_components_wraps_into_a_ready_future() {
-        let mut builder = ViewBuilder::new();
-        add_component(&mut builder, "sibling");
-        builder.if_else(&syn::parse_quote!(cond), |then_branch, _| {
-            add_component(then_branch, "conditional");
-        });
-        let out = rendered(builder);
-        // The empty else branch becomes a ready future so both branches
-        // unify into `Either`.
-        assert!(out.contains("internal :: ready"));
+        let either = quote! { #topcoat_view::internal::EitherView }.to_string();
+        assert!(out.contains(&format!("{either} :: left")));
+        assert!(out.contains(&format!("{either} :: right ({either} :: left")));
+        assert!(out.contains(&format!("{either} :: right ({either} :: right")));
     }
 
     #[test]
     fn expr_kind_selects_matching_builder_method() {
         for (kind, method) in [
-            (ExprKind::Node, "node"),
             (ExprKind::ElementName, "element_name"),
             (ExprKind::Attribute, "attribute"),
             (ExprKind::AttributeUnescaped, "attribute_unescaped"),

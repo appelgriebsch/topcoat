@@ -100,20 +100,27 @@ impl ToTokens for Shard {
         // `Expr<T>` into its evaluated value (for the initial server render)
         // and its JavaScript source (tracked by the browser). The marker
         // struct the face expands to is a unit struct, so `#ident` stays a
-        // value usable directly in `router.shard(...)`.
+        // value usable directly in `router.shard(...)`. The function's doc
+        // comments ride along on the face, so the component expansion carries
+        // them onto the marker.
+        let docs = item.attrs.iter().filter(|attr| attr.path().is_ident("doc"));
         let marker = quote! {
+            #(#docs)*
             #[#topcoat_view_macro::component]
-            #vis async fn #ident(#component_params) -> #topcoat_error::Result<#topcoat_view::View> {
+            #vis async fn #ident(#component_params) -> #topcoat_error::Result<impl #topcoat_view::View> {
                 #(
                     let (#value_idents, #js_idents) = #value_idents.into_evaluated_and_js();
                 )*
-                let __placeholder = #ident::handler(__cx, #(#call_args),*).await?;
+                let __placeholder = #topcoat_view::ViewExt::single(
+                    #ident::handler(__cx, #(#call_args),*).await?,
+                )
+                .await?;
                 let __scope = #topcoat_runtime::ReactiveScope::new(
                     #topcoat_runtime::ShardId::new(#id),
                     ::std::vec![#(#js_idents),*],
                     __placeholder,
                 );
-                #topcoat_view_macro::view! { (__scope) }
+                #topcoat_error::Result::Ok(#topcoat_view_macro::view! { (__scope) })
             }
         };
 
@@ -125,7 +132,10 @@ impl ToTokens for Shard {
         // read.
         let handler = quote! {
             impl #ident {
-                async fn handler(__cx: &#topcoat_context::Cx, #inputs) #output #block
+                async fn handler(
+                    __cx: &#topcoat_context::Cx,
+                    #inputs
+                ) #output #block
             }
         };
 
@@ -151,8 +161,11 @@ impl ToTokens for Shard {
                                 ::from_request(cx, body).await?;
                         let (#(#value_idents,)*) =
                             #topcoat_runtime::Surrogate::into_real(__args);
+                        // The handler's view is the outermost view of this
+                        // request's build, so its content is self-contained.
                         let __view = #ident::handler(cx, #(#call_args),*).await?;
-                        #topcoat_error::Result::Ok(__view)
+                        let __view = #topcoat_view::internal::ScopeView::new(__view);
+                        #topcoat_view::ViewExt::single(__view).await
                     })
                 }
             }
@@ -175,5 +188,28 @@ impl ToTokens for Shard {
             };
         }
         .to_tokens(tokens);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::*;
+
+    #[test]
+    fn doc_comments_ride_along_on_the_component_face() {
+        let shard = Shard::parse(
+            TokenStream::new(),
+            quote! {
+                /// Counts clicks.
+                async fn counter(count: i64) -> Result<impl View> { todo!() }
+            },
+        )
+        .unwrap();
+        let out = shard.to_token_stream().to_string();
+        let doc = out.find("Counts clicks.").expect(&out);
+        let face = out.find("async fn counter").expect(&out);
+        assert!(doc < face, "{out}");
     }
 }

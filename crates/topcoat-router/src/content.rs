@@ -23,6 +23,7 @@ pub mod multipart;
 pub mod sitemap;
 #[cfg(feature = "sse")]
 pub mod sse;
+mod view;
 mod wasm;
 #[cfg(feature = "websocket")]
 pub mod websocket;

@@ -17,22 +17,22 @@ Alpine AJAX is a plugin for Alpine.js core, so the browser must load both, in or
 ```rust
 use topcoat::{
     Result,
-    router::layout,
-    view::view,
+    router::{Slot, layout},
+    view::{View, view},
 };
 
 #[layout]
-async fn root(slot: Result) -> Result {
-    view! {
+async fn root(slot: Slot<'_>) -> Result<impl View> {
+    Ok(view! {
         <!DOCTYPE html>
         <html>
             <head>
                 <script defer="" src="https://cdn.jsdelivr.net/npm/@imacrayon/alpine-ajax@0.12.4/dist/cdn.min.js"></script>
                 <script defer="" src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.0/dist/cdn.min.js"></script>
             </head>
-            <body>(slot?)</body>
+            <body>(slot)</body>
         </html>
-    }
+    })
 }
 ```
 
@@ -45,28 +45,28 @@ use topcoat::{
     Result,
     alpine_ajax::ajax_request,
     context::Cx,
-    router::layout,
-    view::view,
+    router::{Slot, layout},
+    view::{View, view},
 };
 
 #[layout]
-async fn root(cx: &Cx, slot: Result) -> Result {
-    // Alpine AJAX only merges the requested target elements, so we do not
-    // need to return the full layout shell. Just the page's content is
-    // enough.
-    if ajax_request(cx) {
-        return slot;
-    }
-
-    // Non-AJAX requests require a full page render including the layout shell.
-    view! {
-        <html>
-            <body>
-                <nav> /* persistent navigation */ </nav>
-                <main>(slot?)</main>
-            </body>
-        </html>
-    }
+async fn root(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
+    Ok(view! {
+        if ajax_request(cx) {
+            // Alpine AJAX only merges the requested target elements, so we do
+            // not need to render the full layout shell. Just the page's
+            // content is enough.
+            (slot)
+        } else {
+            // Non-AJAX requests require a full page render including the shell.
+            <html>
+                <body>
+                    <nav> /* persistent navigation */ </nav>
+                    <main>(slot)</main>
+                </body>
+            </html>
+        }
+    })
 }
 ```
 
@@ -110,7 +110,7 @@ use topcoat::{
     Result,
     context::Cx,
     router::{StatusCode, response::{IntoResponse, Response}, route},
-    view::view,
+    view::{ViewExt, view},
 };
 
 #[route(POST "/comments")]
@@ -121,6 +121,7 @@ async fn create_comment(cx: &Cx /* , Form(input): Form<NewComment> */) -> Result
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             view! {
+                cx =>
                 <form id="comment_form" x-target="comment_form comments" x-target.422="comment_form">
                     <textarea name="body"></textarea>
                     <p class="error">(message)</p>
@@ -129,7 +130,9 @@ async fn create_comment(cx: &Cx /* , Form(input): Form<NewComment> */) -> Result
                 <div id="alert" x-sync="" role="status">
                     <p>(message)</p>
                 </div>
-            }?,
+            }
+            .single()
+            .await?,
         )
             .into_response(cx);
     }

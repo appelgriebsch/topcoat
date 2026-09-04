@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use topcoat_core::context::Cx;
 
-use crate::{PartsWriter, PromotedStr, StaticStr, Unescaped, View};
+use crate::{PartsWriter, PromotedStr, StaticStr, Unescaped, buffer::ViewHandle};
 
 /// Converts a value used in node position into view parts.
 ///
@@ -12,13 +12,13 @@ use crate::{PartsWriter, PromotedStr, StaticStr, Unescaped, View};
 /// in the [`view!`](https://docs.rs/topcoat/latest/topcoat/view/macro.view.html) macro:
 ///
 /// ```rust
-/// # use topcoat::view::{component, view};
+/// # use topcoat::view::{View, component, view};
 /// # #[component]
-/// # async fn example() -> topcoat::Result {
+/// # async fn example() -> topcoat::Result<impl View> {
 /// # let my_value = "value";
-/// view! {
+/// Ok(view! {
 ///     <div>(my_value)</div>
-/// }
+/// })
 /// # }
 /// ```
 pub trait NodeViewParts {
@@ -26,10 +26,16 @@ pub trait NodeViewParts {
     fn into_view_parts(self, cx: &Cx, parts: &mut PartsWriter<'_>);
 }
 
-impl NodeViewParts for View {
+/// Renders nothing.
+impl NodeViewParts for () {
+    #[inline]
+    fn into_view_parts(self, _cx: &Cx, _parts: &mut PartsWriter<'_>) {}
+}
+
+impl NodeViewParts for ViewHandle {
     #[inline]
     fn into_view_parts(self, _cx: &Cx, parts: &mut PartsWriter<'_>) {
-        parts.push_view(self);
+        parts.push_view_handle(self);
     }
 }
 

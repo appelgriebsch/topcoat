@@ -5,7 +5,11 @@
 //! interface to the browser runtime: nothing maps it on the way out, so a
 //! rename on one side alone would fail only in the browser, at click time.
 
-use topcoat::{context::Cx, runtime::procedure, view::view};
+use topcoat::{
+    context::Cx,
+    runtime::procedure,
+    view::{ViewExt, view},
+};
 
 #[tokio::test]
 async fn toggle_reaches_the_generated_javascript() {
@@ -16,6 +20,8 @@ async fn toggle_reaches_the_generated_javascript() {
 
         <button @click=$(|_e| open.toggle())>"x"</button>
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
@@ -25,12 +31,11 @@ async fn toggle_reaches_the_generated_javascript() {
 #[tokio::test]
 async fn bool_then_avoids_javascript_thenable_assimilation() {
     let cx = &Cx::default();
-    let html = view! {
-        cx =>
-        $(true.then(|| "yes").unwrap())
-    }
-    .unwrap()
-    .render(cx);
+    let html = view! { cx => $(true.then(|| "yes").unwrap()) }
+        .single()
+        .await
+        .unwrap()
+        .render(cx);
 
     assert!(html.contains(".then_("), "{html}");
     assert!(!html.contains(".then("), "{html}");
@@ -46,6 +51,8 @@ async fn increment_and_decrement_reach_the_generated_javascript() {
         <button @click=$(|_e| count.increment())>"+"</button>
         <button @click=$(|_e| count.decrement())>"-"</button>
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
@@ -62,6 +69,8 @@ async fn push_str_reaches_the_generated_javascript_with_its_argument() {
 
         <button @click=$(|_e| name.push_str("!"))>"x"</button>
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
@@ -88,6 +97,8 @@ async fn procedure_call_inside_if_is_an_async_func() {
             "Test"
         </button>
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
@@ -112,6 +123,8 @@ async fn procedure_call_inside_block_is_an_async_func() {
             "Test"
         </button>
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
@@ -136,8 +149,55 @@ async fn push_str_accepts_the_owned_string_from_an_event() {
             @input=$(|e: topcoat::runtime::Event| { message.push_str(e.target.value) })
         >
     }
+    .single()
+    .await
     .unwrap()
     .render(cx);
 
     assert!(html.contains(".push_str("), "{html}");
+}
+
+/// A captured value is serialized into the marker comment that carries the
+/// expression source, so its bytes must not be able to close that comment
+/// early. The `>` of any `-->` in the value renders as an entity, and the
+/// snapshot between the markers is escaped for its text position.
+#[tokio::test]
+async fn a_captured_value_cannot_break_out_of_its_marker_comment() {
+    let cx = &Cx::default();
+    let spicy = String::from(r#"-->"<&"#);
+    let html = view! { cx => <p>$(spicy.to_owned())</p> }
+        .single()
+        .await
+        .unwrap()
+        .render(cx);
+
+    // The capture reaches the client as a hydrated JSON value.
+    assert!(
+        html.contains(r"cx.hydrate(&quot;--&gt;\&quot;<&amp;&quot;)"),
+        "{html}"
+    );
+    // The rendered snapshot of the value is escaped for text.
+    assert!(html.contains(r#"-->--&gt;"&lt;&amp;<!--"#), "{html}");
+    // The raw value appears nowhere in the document.
+    assert!(!html.contains(r#"-->"<&"#), "{html}");
+}
+
+/// A string literal reaches the handler attribute as a hydrated surrogate
+/// with every quote escaped, so it cannot terminate the attribute value.
+#[tokio::test]
+async fn a_string_literal_with_quotes_stays_inside_the_handler_attribute() {
+    let cx = &Cx::default();
+    let html = view! {
+        cx =>
+        signal name = String::new();
+
+        <button @click=$(|_e| name.push_str("say \"hi\""))>"x"</button>
+    }
+    .single()
+    .await
+    .unwrap()
+    .render(cx);
+
+    assert!(html.contains(r"say \&quot;hi\&quot;"), "{html}");
+    assert!(!html.contains(r#"say \"hi"#), "{html}");
 }

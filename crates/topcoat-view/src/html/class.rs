@@ -331,13 +331,13 @@ impl_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
 /// class list without present entries omits the whole attribute:
 ///
 /// ```rust
-/// # use topcoat::view::{class, component, view};
+/// # use topcoat::view::{View, class, component, view};
 /// # #[component]
-/// # async fn example() -> topcoat::Result {
+/// # async fn example() -> topcoat::Result<impl View> {
 /// # let is_active = true;
-/// view! {
+/// Ok(view! {
 ///     <button class=(class!("btn", "active" if is_active))>"Save"</button>
-/// }
+/// })
 /// # }
 /// ```
 #[derive(Debug, Default, Clone, Copy)]
@@ -393,18 +393,11 @@ pub type StaticClass = Class<Unescaped<PromotedStr>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AttributeValue,
-        buffer::ViewBufferScope,
-        internal::{block, build_sync},
-    };
+    use crate::{AttributeValue, Attributes, internal::Builder};
 
     fn render(class: Class<impl ClassEntries>) -> String {
-        let (html, _) = ViewBufferScope::scope_sync(|| {
-            let cx = Cx::default();
-            build_sync(|| block(&cx, |b| b.attribute_value(class))).render(&cx)
-        });
-        html
+        let cx = Cx::default();
+        Builder::build(&cx, |b| b.attribute_value(class)).render(&cx)
     }
 
     #[test]
@@ -502,16 +495,12 @@ mod tests {
     }
 
     #[test]
-    fn attribute_value_entries_are_spliced_verbatim() {
-        ViewBufferScope::scope_sync(|| {
-            let cx = Cx::default();
-            let value = AttributeValue::captured(build_sync(|| {
-                block(&cx, |b| b.attribute_value("[&>*]:mt-2"))
-            }));
-            let html = build_sync(|| block(&cx, |b| b.attribute_value(Class(("btn", &value)))))
-                .render(&cx);
-            assert_eq!(html, "btn [&amp;>*]:mt-2");
-        });
+    fn attribute_value_entries_are_spliced_as_captured() {
+        let cx = Cx::default();
+        let mut attrs = Attributes::new();
+        attrs.insert(&cx, "class", "[&>*]:mt-2");
+        let value = attrs.remove("class").unwrap();
+        assert_eq!(render(Class(("btn", &value))), "btn [&amp;>*]:mt-2");
     }
 
     #[test]

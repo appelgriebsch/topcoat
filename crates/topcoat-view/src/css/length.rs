@@ -544,10 +544,7 @@ impl AttributeValueViewParts for Length {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        buffer::ViewBufferScope,
-        internal::{block, build_sync},
-    };
+    use crate::internal::Builder;
 
     /// Every unit constructor paired with its rendered form. The numeric value
     /// is the same across cases so each assertion focuses on the unit suffix.
@@ -604,11 +601,8 @@ mod tests {
     ];
 
     fn render(value: impl AttributeValueViewParts) -> String {
-        let (html, _) = ViewBufferScope::scope_sync(|| {
-            let cx = Cx::default();
-            build_sync(|| block(&cx, |b| b.attribute_value(value))).render(&cx)
-        });
-        html
+        let cx = Cx::default();
+        Builder::build(&cx, |b| b.attribute_value(value)).render(&cx)
     }
 
     #[test]

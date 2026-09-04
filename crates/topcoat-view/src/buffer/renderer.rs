@@ -10,10 +10,9 @@ use crate::{
 /// Executes a view's instruction block into a [`Formatter`].
 ///
 /// Execution starts at the view's entry, descends into nested views through
-/// [`Call`](Instruction::Call) instructions, follows the
-/// [`Jmp`](Instruction::Jmp) redirects of filled view slots, and finishes
-/// when a [`Ret`](Instruction::Ret) is reached with an empty call stack.
-pub struct Renderer<'a> {
+/// [`Call`](Instruction::Call) instructions, and finishes when a
+/// [`Ret`](Instruction::Ret) is reached with an empty call stack.
+pub(super) struct Renderer<'a> {
     buffer: &'a ViewBuffer,
     ptr: InstructionPtr,
     stack: Vec<InstructionPtr>,
@@ -21,7 +20,7 @@ pub struct Renderer<'a> {
 
 impl<'a> Renderer<'a> {
     #[must_use]
-    pub fn new(buffer: &'a ViewBuffer, entry: InstructionPtr) -> Self {
+    pub(super) fn new(buffer: &'a ViewBuffer, entry: InstructionPtr) -> Self {
         Self {
             buffer,
             ptr: entry,
@@ -30,12 +29,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Executes instructions from the entry until the block returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics if execution reaches a reserved view slot that was never
-    /// filled.
-    pub fn execute(&mut self, cx: &Cx, f: &mut Formatter<'_>) {
+    pub(super) fn execute(&mut self, cx: &Cx, f: &mut Formatter<'_>) {
         use std::fmt::Write;
 
         let consts = self.buffer.consts();
@@ -52,11 +46,7 @@ impl<'a> Renderer<'a> {
                     Some(ptr) => self.ptr = ptr,
                     None => break,
                 },
-                Instruction::Jmp { entry } => self.ptr = *entry,
-                Instruction::Placeholder => {
-                    panic!("tried to render a placeholder view before it was filled")
-                }
-                Instruction::View { ptr } => {
+                Instruction::ViewHandle { ptr } => {
                     let (buffer, entry) = consts.fetch_view(*ptr);
                     Renderer::new(buffer, entry).execute(cx, f);
                 }
@@ -98,6 +88,17 @@ impl<'a> Renderer<'a> {
                 }
                 Instruction::Dyn { ptr, context } => {
                     consts.fetch_dyn(*ptr).render(cx, &mut context.writer(f));
+                }
+
+                Instruction::RegionStart(region) => {
+                    f.write_str("<!--topcoat::region::start(");
+                    f.write_str(region.as_u64().format_into(&mut NumBuffer::new()));
+                    f.write_str(")-->");
+                }
+                Instruction::RegionEnd(region) => {
+                    f.write_str("<!--topcoat::region::end(");
+                    f.write_str(region.as_u64().format_into(&mut NumBuffer::new()));
+                    f.write_str(")-->");
                 }
 
                 #[cfg(feature = "http")]

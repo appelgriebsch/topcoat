@@ -1,11 +1,11 @@
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::{
     Ident, Token,
     ext::IdentExt,
     parse::{Parse, ParseStream},
 };
-use topcoat_core_grammar::paths::topcoat_mail;
+use topcoat_core_grammar::paths::{topcoat_mail, topcoat_view};
 
 use crate::mail::FieldValue;
 
@@ -63,10 +63,12 @@ impl MailField {
 
         match value {
             FieldValue::Html(html) => {
-                let view = &html.view;
+                let view = html.view.to_token_stream();
                 quote! {
                     let __html = #view;
-                    let __builder = __builder.#method(__html?);
+                    let __builder = __builder.#method(
+                        #topcoat_view::ViewExt::single(__html).await?,
+                    );
                 }
             }
             FieldValue::Expr(value) => match self.name().as_str() {

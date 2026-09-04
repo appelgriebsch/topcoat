@@ -2,11 +2,11 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        Body, Router, RouterBuilderDiscoverExt, StatusCode,
+        Body, Router, RouterBuilderDiscoverExt, Slot, StatusCode,
         error::{ForbiddenError, NotFoundError, RouterErrorExt, forbidden, rewrite},
         href, layout, not_found, page, path_param,
     },
-    view::view,
+    view::{View, error_boundary, view},
 };
 
 #[tokio::main]
@@ -17,8 +17,8 @@ async fn main() {
 }
 
 #[page("/")]
-async fn home() -> Result {
-    view! {
+async fn home() -> Result<impl View> {
+    Ok(view! {
         <h1>"Error handling"</h1>
         <ul>
             <li><a href=(href!(post, PostId(1)))>"An existing post"</a></li>
@@ -28,40 +28,49 @@ async fn home() -> Result {
             // No route serves this URL, so there is no target to point at.
             <li><a href="/no/such/page">"An unrouted URL (404)"</a></li>
         </ul>
-    }
+    })
 }
 
-// An error keeps its type on the way out, so the layout can downcast it and
-// replace it with a branded error page.
+// An error keeps its type on the way out, so an error boundary around the slot
+// can downcast it and replace the page with a branded error page.
 #[layout("/")]
-async fn root_layout(slot: Result) -> Result {
-    let content = match slot {
-        Err(error) if error.downcast_ref::<NotFoundError>().is_some() => view! {
-            (StatusCode::NOT_FOUND)
-            <h1>"Page not found"</h1>
-        },
-        Err(error) if error.downcast_ref::<ForbiddenError>().is_some() => view! {
-            (StatusCode::FORBIDDEN)
-            <h1>"Access denied"</h1>
-        },
-        content => content,
-    }?;
-
-    view! {
+async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
+    Ok(view! {
         <html>
             <body>
-                (content)
+                error_boundary(
+                    fallback: |error| {
+                        let (status_code, heading) = if error
+                            .downcast_ref::<NotFoundError>()
+                            .is_some() {
+                            (StatusCode::NOT_FOUND, "Page not found")
+                        } else if error.downcast_ref::<ForbiddenError>().is_some() {
+                            (StatusCode::FORBIDDEN, "Access denied")
+                        } else {
+                            // Any other error is rethrown for the handler to answer.
+                            return Err(error);
+                        };
+
+                        Ok(
+                            view! {
+                                (status_code)
+                                <h1>(heading)</h1>
+                            },
+                        )
+                    },
+                    (slot)
+                )
                 <p><a href=(href!(home))>"Home"</a></p>
             </body>
         </html>
-    }
+    })
 }
 
 path_param!(post_id: u64, error = bad_request);
 
-// ok_or_not_found turns the None into a 404, which the layout catches above.
+// ok_or_not_found turns the None into a 404, which the error handler catches above.
 #[page("/posts/{post_id}")]
-async fn post(cx: &Cx) -> Result {
+async fn post(cx: &Cx) -> Result<impl View> {
     let title = match *path_param::<PostId>(cx)? {
         1 => Some("Hello Topcoat"),
         2 => Some("Error handling"),
@@ -69,24 +78,24 @@ async fn post(cx: &Cx) -> Result {
     }
     .ok_or_not_found()?;
 
-    view! { <h1>(title)</h1> }
+    Ok(view! { <h1>(title)</h1> })
 }
 
 // An error constructor converts into the handler's error type.
 #[page("/admin")]
-async fn admin() -> Result {
+async fn admin() -> Result<()> {
     Err(forbidden().into())
 }
 
 // A rewrite starts a new server-side dispatch without changing the browser URL.
 #[page("/rewrite")]
-async fn rewrite_page() -> Result {
+async fn rewrite_page() -> Result<()> {
     Err(rewrite("/rewritten", Body::empty()).into())
 }
 
 #[page("/rewritten")]
-async fn rewritten() -> Result {
-    view! { <h1>"The rewrite target"</h1> }
+async fn rewritten() -> Result<impl View> {
+    Ok(view! { <h1>"The rewrite target"</h1> })
 }
 
 // A URL matching no route is normally answered with a bare 404 that skips the

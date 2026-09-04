@@ -24,37 +24,35 @@ impl Emit for IfElse {
             else_branch,
         } = self;
 
-        let renders_components = then_branch.is_async() || else_branch.is_async();
-        if emitter.inline_await() || !renders_components {
-            let then_branch = then_branch.emit_view();
-            // An empty else branch still yields the empty view, so both
-            // branches produce a view to splice.
-            let else_branch = else_branch.emit_view();
+        if then_branch.is_async() || else_branch.is_async() {
+            // The branches build views of different types; `EitherView`
+            // unifies them, and only the taken branch is driven as this
+            // position's unit. The then branch takes the bindings of the
+            // condition's `let` patterns with it; the else branch binds
+            // nothing.
+            let then_branch = then_branch.emit_captured(&Bindings::of_condition(expr));
+            let else_branch = else_branch.emit_inert();
+
+            emitter.hoist(quote! {
+                let #ident = if #expr {
+                    #topcoat_view::internal::EitherView::left(#then_branch)
+                } else {
+                    #topcoat_view::internal::EitherView::right(#else_branch)
+                };
+            });
+            emitter.unit(Span::call_site(), &ident);
+        } else {
+            // The taken branch builds its block right inside the branch,
+            // where the condition's bindings are alive. An empty else
+            // branch still yields the empty view, so both branches produce
+            // a handle to splice.
+            let then_branch = then_branch.emit_block();
+            let else_branch = else_branch.emit_block();
 
             emitter.hoist(quote! {
                 let #ident = if #expr { #then_branch } else { #else_branch };
             });
-        } else {
-            // In a joined position the branches yield futures instead of
-            // views, so the taken branch joins with the scope's other
-            // components. `Either` unifies the two future types. The then
-            // future carries the bindings of the condition's `let` patterns,
-            // which die with the branch it is created in.
-            let then_branch = then_branch.emit_future(&Bindings::of_condition(expr));
-            let else_branch = else_branch.emit_future(&Bindings::empty());
-
-            emitter.hoist_future(
-                Span::call_site(),
-                &ident,
-                &quote! {
-                    if #expr {
-                        #topcoat_view::internal::Either::Left(#then_branch)
-                    } else {
-                        #topcoat_view::internal::Either::Right(#else_branch)
-                    }
-                },
-            );
+            emitter.burst(quote! { __b.view(#ident); });
         }
-        emitter.burst(quote! { __b.view(#ident); });
     }
 }

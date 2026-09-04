@@ -1,22 +1,18 @@
 #[cfg(feature = "http")]
 use crate::buffer::HeadersPtr;
 use crate::{
-    HtmlContext,
+    HtmlContext, RegionId,
     buffer::{DynPtr, InstructionPtr, StaticStrPtr, StringPtr, ViewPtr},
 };
 
 #[derive(Debug, Clone)]
-pub enum Instruction {
+pub(super) enum Instruction {
     /// Jump into a nested block, returning here at its [`Ret`](Self::Ret).
     Call { entry: InstructionPtr },
     /// Return back to the previous call instruction, if any.
     Ret,
-    /// Jump to `entry` without recording a return address.
-    Jmp { entry: InstructionPtr },
-    /// Holds a reserved slot until it is filled; executing it panics.
-    Placeholder,
     /// Execute a spliced owned view's block in the buffer it carries.
-    View { ptr: ViewPtr },
+    ViewHandle { ptr: ViewPtr },
 
     /// A boolean rendered as text.
     #[non_exhaustive]
@@ -97,6 +93,11 @@ pub enum Instruction {
     },
     /// A part that writes its output at render time, and its context.
     Dyn { ptr: DynPtr, context: HtmlContext },
+
+    /// The start of a region.
+    RegionStart(RegionId),
+    /// The end of a region.
+    RegionEnd(RegionId),
 
     /// A response status code recorded at render time; renders no content.
     #[cfg(feature = "http")]

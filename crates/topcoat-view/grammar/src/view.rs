@@ -21,7 +21,7 @@ use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 pub use signal_declaration::*;
 use syn::parse::{Parse, ParseStream};
-use topcoat_core_grammar::ParseOption;
+use topcoat_core_grammar::{ParseOption, paths::topcoat_context};
 
 use crate::{
     leading_cx::LeadingCx,
@@ -54,22 +54,20 @@ impl ToTokens for View {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let mut builder = ViewBuilder::new();
         self.nodes.lower(&mut builder);
-        let view = builder.finish().emit_root();
+        let owns_cx = self.cx.is_some();
+        let view = builder.finish().emit_view(owns_cx);
 
-        // When an explicit context is named, bind it to the `__cx` identifier
-        // the generated code (component invocations) reads from. Inside a
-        // component/page/layout this binding is already in scope, so we emit
-        // the view untouched.
         match &self.cx {
-            Some(cx) => quote! {
-                {
-                    #cx
+            Some(cx) => {
+                let cx = &cx.cx;
+                quote! {{
+                    let __cx: #topcoat_context::Cx = (#cx).clone();
                     #view
-                }
+                }}
             }
-            .to_tokens(tokens),
-            None => view.to_tokens(tokens),
+            None => view,
         }
+        .to_tokens(tokens);
     }
 }
 
@@ -137,12 +135,29 @@ mod tests {
     #[test]
     fn explicit_cx_binds_the_context_identifier() {
         let tokens = parse("cx => <div></div>").to_token_stream().to_string();
-        assert!(tokens.contains("let __cx"), "{tokens}");
+        assert!(tokens.contains("Cx = (cx) . clone () ;"), "{tokens}");
+        assert!(tokens.contains("let __cx = & __cx ;"), "{tokens}");
     }
 
     #[test]
     fn omitted_cx_emits_no_binding() {
+        // The view borrows whatever context is already in scope instead of
+        // cloning one of its own.
         let tokens = parse("<div></div>").to_token_stream().to_string();
         assert!(!tokens.contains("let __cx"), "{tokens}");
+    }
+
+    #[test]
+    fn explicit_cx_takes_part_in_the_enclosing_build() {
+        let tokens = parse("cx => <div></div>").to_token_stream().to_string();
+        assert!(tokens.contains("ScopeView :: new ("), "{tokens}");
+        assert!(!tokens.contains("self_contained"), "{tokens}");
+    }
+
+    #[test]
+    fn omitted_cx_takes_part_in_the_enclosing_build() {
+        let tokens = parse("<div></div>").to_token_stream().to_string();
+        assert!(tokens.contains("ScopeView :: new ("), "{tokens}");
+        assert!(tokens.contains("MoveView :: drive ("), "{tokens}");
     }
 }

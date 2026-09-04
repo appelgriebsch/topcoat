@@ -21,27 +21,28 @@ impl Emit for ForLoop {
         let Self { pat, expr, body } = self;
 
         if body.is_async() {
-            // A body that renders components yields one future per
-            // iteration; joining them renders all iterations concurrently.
-            // Each future carries its iteration's pattern bindings, which
-            // die with the iteration, and borrows the rest of its
-            // environment, so iterations share outer values.
-            let body = body.emit_future(&Bindings::of_pattern(pat));
-            emitter.hoist_future(
-                Span::call_site(),
-                &ident,
-                &quote! {{
-                    let mut __futures = ::std::vec::Vec::new();
+            // The iterations become one `LoopView`, driven as one unit of
+            // the enclosing template, so all iterations render concurrently
+            // and splice in iteration order. Each iteration's view is built
+            // inside the iteration and takes the pattern's bindings with
+            // it. The views share one type, and pinning each on the heap
+            // lets the loop hold them in a plain `Vec`.
+            let body = body.emit_captured(&Bindings::of_pattern(pat));
+            emitter.hoist(quote! {
+                let #ident = {
+                    let mut __iterations = ::std::vec::Vec::new();
                     for #pat in #expr {
-                        __futures.push(#body);
+                        __iterations.push(::std::boxed::Box::pin(#body));
                     }
-                    #topcoat_view::internal::try_join_all(__futures)
-                }},
-            );
+                    #topcoat_view::internal::LoopView::new(__iterations)
+                };
+            });
+            emitter.unit(Span::call_site(), &ident);
         } else {
-            // The hoist phase builds one view per iteration; the burst phase
-            // splices them into the enclosing block in iteration order.
-            let body = body.emit_view();
+            // Each iteration builds its block right inside the iteration,
+            // where the pattern's bindings are alive; the burst splices the
+            // handles in iteration order.
+            let body = body.emit_block();
             emitter.hoist(quote! {
                 let #ident = {
                     let mut __views = ::std::vec::Vec::new();
@@ -51,11 +52,11 @@ impl Emit for ForLoop {
                     __views
                 };
             });
+            emitter.burst(quote! {
+                for __view in #ident {
+                    __b.view(__view);
+                }
+            });
         }
-        emitter.burst(quote! {
-            for __loop_view in #ident {
-                __b.view(__loop_view);
-            }
-        });
     }
 }

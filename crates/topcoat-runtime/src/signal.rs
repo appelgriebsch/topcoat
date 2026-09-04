@@ -219,9 +219,25 @@ impl EncodedSignals {
 
 #[cfg(test)]
 mod tests {
-    use topcoat_view::internal::{block, build_sync};
+    use std::{
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use topcoat::view::{ViewExt, view};
 
     use super::*;
+
+    /// Drives a future that never yields to completion.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+        }
+    }
 
     #[test]
     fn payload_cannot_terminate_the_comment() {
@@ -230,13 +246,13 @@ mod tests {
         let signal = Signal::new(String::from("a-->b\"c&d"));
 
         let cx = Cx::default();
-        let view = build_sync(|| block(&cx, |b| b.node(SignalDeclaration::new(&signal))));
-        let html = view.render(&cx);
+        let view = view! { cx => (SignalDeclaration::new(&signal)) };
+        let html = block_on(view.single()).unwrap().render(&cx);
 
         // The comment context escaped `>`, so the only `-->` left is the
         // marker's own terminator; the payload cannot end the comment early.
         assert_eq!(html.matches("-->").count(), 1);
-        assert!(html.ends_with(") -->"));
+        assert!(html.ends_with(")-->"), "{html}");
         assert!(html.contains("--&gt;"));
         // The JSON's own quotes round-trip as entities the client decodes.
         assert!(html.contains("&quot;"));

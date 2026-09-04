@@ -344,21 +344,21 @@ mod tests {
     use std::{
         borrow::Cow,
         future::Future,
-        pin::Pin,
         sync::{Arc, Mutex, OnceLock},
     };
 
     use http::{HeaderMap, StatusCode};
-    use topcoat::view::{DynViewPart, HtmlWriter, NodeViewParts, PartsWriter, View, view};
+    use topcoat::view::{DynViewPart, HtmlWriter, NodeViewParts, PartsWriter, view};
     use topcoat_core::{
         context::{Cx, app_context, request_context},
         error::Result,
     };
+    use topcoat_view::{BoxView, ViewExt, internal::MoveView};
 
     use super::*;
     use crate::{
         Body, HrefTarget, LayerFn, LayerFuture, LayoutFn, Method, Methods, OriginPolicy, PageFn,
-        Path, Route, RouteFn, RouteFuture,
+        Path, Route, RouteFn, RouteFuture, Slot,
         error::rewrite,
         raw_path_params,
         request::{Bytes, original_uri, uri},
@@ -486,12 +486,8 @@ mod tests {
     }
 
     // Page and layout render functions for the rendering tests.
-    type ViewFuture<'cx> = Pin<Box<dyn Future<Output = Result<View>> + Send + 'cx>>;
-
-    fn render_page(cx: &Cx, _body: Body) -> ViewFuture<'_> {
-        Box::pin(async move {
-            view! { cx => "page" }
-        })
+    fn render_page(cx: &Cx, _body: Body) -> BoxView<'static> {
+        view! { cx => "page" }.boxed()
     }
 
     /// A view part that panics when it renders, so the router's panic
@@ -511,36 +507,30 @@ mod tests {
         }
     }
 
-    fn render_panicking_page(cx: &Cx, _body: Body) -> ViewFuture<'_> {
-        Box::pin(async move {
-            view! { cx => (Panicking) }
-        })
+    fn render_panicking_page(cx: &Cx, _body: Body) -> BoxView<'static> {
+        view! { cx => (Panicking) }.boxed()
     }
 
     /// Wraps the child content in `R[ ... ]` so layout nesting is observable.
-    fn layout_root(cx: &Cx, slot: Result<View>) -> ViewFuture<'_> {
-        Box::pin(async move {
-            let inner = slot?;
-            view! {
-                cx =>
-                "R["
-                (inner)
-                "]"
-            }
-        })
+    fn layout_root<'a>(cx: &Cx, slot: Slot<'a>) -> BoxView<'a> {
+        view! {
+            cx =>
+            "R["
+            (slot)
+            "]"
+        }
+        .boxed()
     }
 
     /// Wraps the child content in `A[ ... ]`.
-    fn layout_admin(cx: &Cx, slot: Result<View>) -> ViewFuture<'_> {
-        Box::pin(async move {
-            let inner = slot?;
-            view! {
-                cx =>
-                "A["
-                (inner)
-                "]"
-            }
-        })
+    fn layout_admin<'a>(cx: &Cx, slot: Slot<'a>) -> BoxView<'a> {
+        view! {
+            cx =>
+            "A["
+            (slot)
+            "]"
+        }
+        .boxed()
     }
 
     // -- Router::handle: dispatch --
@@ -706,12 +696,16 @@ mod tests {
         Box::pin(async move { Err(rewrite("/x", Body::empty()).into()) })
     }
 
-    fn render_rewriting_page(_cx: &Cx, _body: Body) -> ViewFuture<'_> {
-        Box::pin(async move { Err(rewrite("/x", Body::empty()).into()) })
+    fn render_rewriting_page(_cx: &Cx, _body: Body) -> BoxView<'static> {
+        Box::pin(MoveView::new(async move {
+            Err(rewrite("/x", Body::empty()).into())
+        }))
     }
 
-    fn layout_rewrites(_cx: &Cx, _slot: Result<View>) -> ViewFuture<'_> {
-        Box::pin(async move { Err(rewrite("/x", Body::empty()).into()) })
+    fn layout_rewrites<'a>(_cx: &Cx, _slot: Slot<'a>) -> BoxView<'a> {
+        Box::pin(MoveView::new(async move {
+            Err(rewrite("/x", Body::empty()).into())
+        }))
     }
 
     fn rewrite_to_missing(_cx: &Cx, _body: Body) -> RouteFuture<'_> {
